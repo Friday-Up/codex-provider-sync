@@ -55,15 +55,19 @@ jobs:
           node-version: "24"
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
       - name: Install dependencies
         working-directory: ./codex-provider-gui
         run: npm ci
       - name: Build Tauri App
         working-directory: ./codex-provider-gui
-        run: npm run tauri build -- --target x86_64-pc-windows-msvc
+        shell: pwsh
+        run: |
+          $env:TAURI_SIGNING_PRIVATE_KEY = ""
+          npm run tauri build -- --target x86_64-pc-windows-msvc --bundles msi
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             codex-provider-gui/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/**/*.msi
-            codex-provider-gui/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/**/*.exe
