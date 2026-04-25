@@ -60,10 +60,10 @@ jobs:
         run: npm ci
       - name: Build Tauri App
         working-directory: ./codex-provider-gui
-        run: npm run tauri build
+        run: npm run tauri build -- --target x86_64-pc-windows-msvc
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            codex-provider-gui/src-tauri/target/release/bundle/**/*.msi
-            codex-provider-gui/src-tauri/target/release/bundle/**/*.exe
+            codex-provider-gui/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/**/*.msi
+            codex-provider-gui/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/**/*.exe
