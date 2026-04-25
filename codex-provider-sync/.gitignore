@@ -1,0 +1,9 @@
+node_modules/
+coverage/
+*.tgz
+artifacts/
+desktop/**/bin/
+desktop/**/obj/
+*.csproj.user
+test/*.exe
+WORKLOG*.md

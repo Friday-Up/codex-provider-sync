@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Codex Provider Sync</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Codex Provider Sync</h1>
+      <p class="subtitle">切换登录方式时同步会话历史</p>
+    </header>
+
+    <main>
+      <section class="intro-section">
+        <h2>这是什么工具？</h2>
+        <p class="desc">
+          Codex CLI 支持两种登录方式：<strong>OpenAI 官方 OAuth</strong> 和 <strong>第三方 API Key</strong>。
+          两种方式的会话历史是隔离的。本工具可以在你切换登录方式前，把历史会话迁移到目标 provider，
+          让你在新登录方式下也能看到之前的所有会话。
+        </p>
+        <p class="desc highlight">
+          <strong>使用方式：</strong>切换登录前，先选择目标 provider，点击"同步历史"。
+          例如：从 API 登录切到官方登录前，选择 openai 并同步。
+        </p>
+      </section>
+
+      <section class="status-section">
+        <h2>当前状态</h2>
+        <p class="hint">查看当前 Codex 目录中 openai 和 custom 的会话分布情况。</p>
+        <button id="btn-status" class="btn btn-primary">刷新状态</button>
+        <pre id="status-output" class="output"></pre>
+      </section>
+
+      <section class="sync-section">
+        <h2>同步历史会话</h2>
+        <p class="hint">
+          选择目标 provider，工具会把所有历史会话迁移到该 provider。
+        </p>
+        <div class="sync-options">
+          <button id="btn-sync-openai" class="btn btn-success sync-option-btn">
+            <span class="sync-option-title">同步到 OpenAI 官方 OAuth</span>
+            <span class="sync-option-desc">将所有会话的 provider 改为 openai</span>
+          </button>
+          <button id="btn-sync-custom" class="btn btn-success sync-option-btn">
+            <span class="sync-option-title">同步到第三方 API Key</span>
+            <span class="sync-option-desc">将所有会话的 provider 改为 custom</span>
+          </button>
+        </div>
+      </section>
+
+      <section class="restore-section">
+        <h2>从备份恢复</h2>
+        <p class="hint">如果同步出错，可以从之前的备份恢复。</p>
+        <div class="input-group">
+          <label for="backup-dir">备份目录路径：</label>
+          <input type="text" id="backup-dir" placeholder="例如：/Users/xxx/.codex/backups_state/provider-sync/2026...">
+        </div>
+        <button id="btn-restore" class="btn btn-warning">恢复备份</button>
+      </section>
+
+      <section class="log-section">
+        <h2>操作日志</h2>
+        <pre id="log-output" class="output log"></pre>
+        <button id="btn-clear-log" class="btn btn-small">清空日志</button>
+      </section>
+    </main>
+
+    <footer>
+      <p>codex-provider-sync GUI v1.0.0</p>
+    </footer>
+  </div>
+
+  <script src="main.js"></script>
+</body>
+</html>

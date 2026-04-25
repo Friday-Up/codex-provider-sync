@@ -1,0 +1,423 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+
+import {
+  DEFAULT_BACKUP_RETENTION_COUNT,
+  DEFAULT_PROVIDER,
+  defaultBackupRoot,
+  defaultCodexHome
+} from "./constants.js";
+import {
+  configDeclaresProvider,
+  listConfiguredProviderIds,
+  readConfigText,
+  readCurrentProviderFromConfigText,
+  setRootProviderInConfigText,
+  writeConfigText
+} from "./config-file.js";
+import {
+  createBackup,
+  getBackupSummary,
+  pruneBackups,
+  restoreBackup,
+  updateSessionBackupManifest
+} from "./backup.js";
+import { acquireLock } from "./locking.js";
+import {
+  applySessionChanges,
+  collectSessionChanges,
+  restoreSessionChanges,
+  splitLockedSessionChanges,
+  summarizeProviderCounts
+} from "./session-files.js";
+import {
+  assertSqliteWritable,
+  readSqliteProviderCounts,
+  updateSqliteProvider
+} from "./sqlite-state.js";
+import { runWatch, runWatchOnce } from "./watcher.js";
+import { runCoexist, runCoexistCleanup } from "./coexist.js";
+
+function normalizeCodexHome(explicitCodexHome) {
+  return path.resolve(explicitCodexHome ?? process.env.CODEX_HOME ?? defaultCodexHome());
+}
+
+async function ensureCodexHome(codexHome) {
+  await fs.access(codexHome);
+}
+
+function formatCounts(counts) {
+  return Object.entries(counts ?? {})
+    .map(([provider, count]) => `${provider}: ${count} 个`)
+    .join(", ") || "（无）";
+}
+
+function formatBytes(bytes) {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return unitIndex === 0 ? `${bytes} B` : `${value.toFixed(value >= 10 ? 1 : 2).replace(/\.0$/, "")} ${units[unitIndex]}`;
+}
+
+function emitProgress(onProgress, event) {
+  if (typeof onProgress === "function") {
+    onProgress(event);
+  }
+}
+
+function sumCounts(counts) {
+  return Object.values(counts ?? {}).reduce((total, value) => total + value, 0);
+}
+
+function buildEncryptedContentWarning(encryptedContentCounts, targetProvider) {
+  const riskyProviders = new Set();
+  for (const scope of ["sessions", "archived_sessions"]) {
+    for (const [provider, count] of Object.entries(encryptedContentCounts?.[scope] ?? {})) {
+      if (count > 0 && provider !== targetProvider) {
+        riskyProviders.add(provider);
+      }
+    }
+  }
+  const total = sumCounts(encryptedContentCounts?.sessions) + sumCounts(encryptedContentCounts?.archived_sessions);
+  if (riskyProviders.size === 0) {
+    return null;
+  }
+  return `加密内容警告: ${total} 个会话文件包含来自 ${[...riskyProviders].sort().join(", ")} 的加密内容。可见性元数据可以同步到 ${targetProvider}，但继续或压缩这些历史记录可能会因加密内容无效而失败。如需可靠地继续会话，请返回原始 provider/账户，或开始新会话。`;
+}
+
+export async function getStatus({ codexHome: explicitCodexHome } = {}) {
+  const codexHome = normalizeCodexHome(explicitCodexHome);
+  await ensureCodexHome(codexHome);
+  const configPath = path.join(codexHome, "config.toml");
+  const configText = await readConfigText(configPath);
+  const current = readCurrentProviderFromConfigText(configText);
+  const configuredProviders = listConfiguredProviderIds(configText);
+  const {
+    providerCounts,
+    encryptedContentCounts,
+    lockedPaths
+  } = await collectSessionChanges(codexHome, "__status_only__", { skipLockedReads: true });
+  const sqliteCounts = await readSqliteProviderCounts(codexHome);
+  const backupSummary = await getBackupSummary(codexHome);
+
+  return {
+    codexHome,
+    currentProvider: current.provider,
+    currentProviderImplicit: current.implicit,
+    configuredProviders,
+    rolloutCounts: summarizeProviderCounts(providerCounts),
+    lockedRolloutFiles: lockedPaths,
+    encryptedContentCounts,
+    encryptedContentWarning: buildEncryptedContentWarning(encryptedContentCounts, current.provider ?? DEFAULT_PROVIDER),
+    sqliteCounts,
+    backupRoot: defaultBackupRoot(codexHome),
+    backupSummary
+  };
+}
+
+export function renderStatus(status) {
+  const lines = [
+    `Codex 主目录: ${status.codexHome}`,
+    `当前 provider: ${status.currentProvider}${status.currentProviderImplicit ? "（隐式默认值）" : ""}`,
+    `已配置的 provider: ${status.configuredProviders.join(", ")}`,
+    `备份数量: ${status.backupSummary.count} 个（共 ${formatBytes(status.backupSummary.totalBytes)}）`,
+    `备份根目录: ${status.backupRoot}`
+  ];
+
+  lines.push("");
+  lines.push("会话文件分布:");
+  lines.push(`  活跃会话: ${formatCounts(status.rolloutCounts.sessions)}`);
+  lines.push(`  归档会话: ${formatCounts(status.rolloutCounts.archived_sessions)}`);
+  if (status.encryptedContentCounts) {
+    lines.push(`  加密内容（活跃）: ${formatCounts(status.encryptedContentCounts.sessions)}`);
+    lines.push(`  加密内容（归档）: ${formatCounts(status.encryptedContentCounts.archived_sessions)}`);
+  }
+  if (status.encryptedContentWarning) {
+    lines.push(`  ⚠️ ${status.encryptedContentWarning}`);
+  }
+  if (status.lockedRolloutFiles?.length) {
+    lines.push(`  跳过的锁定文件: ${status.lockedRolloutFiles.length} 个`);
+  }
+
+  lines.push("");
+  lines.push("SQLite 数据库状态:");
+  if (status.sqliteCounts?.unreadable) {
+    lines.push(`  ❌ ${status.sqliteCounts.error ?? "state_5.sqlite 损坏或无法读取"}`);
+  } else if (!status.sqliteCounts) {
+    lines.push("  未找到 state_5.sqlite");
+  } else {
+    lines.push(`  活跃会话: ${formatCounts(status.sqliteCounts.sessions)}`);
+    lines.push(`  归档会话: ${formatCounts(status.sqliteCounts.archived_sessions)}`);
+  }
+
+  return lines.join("\n");
+}
+
+export async function runSync({
+  codexHome: explicitCodexHome,
+  provider,
+  configBackupText,
+  keepCount = DEFAULT_BACKUP_RETENTION_COUNT,
+  sqliteBusyTimeoutMs,
+  onProgress
+} = {}) {
+  if (!Number.isInteger(keepCount) || keepCount < 1) {
+    throw new Error(`Invalid automatic keep count: ${keepCount}. Expected an integer greater than or equal to 1.`);
+  }
+
+  const codexHome = normalizeCodexHome(explicitCodexHome);
+  await ensureCodexHome(codexHome);
+  const configPath = path.join(codexHome, "config.toml");
+  const configText = await readConfigText(configPath);
+  const current = readCurrentProviderFromConfigText(configText);
+  const targetProvider = provider ?? current.provider ?? DEFAULT_PROVIDER;
+
+  const releaseLock = await acquireLock(codexHome, "sync");
+  let backupDir = null;
+  let backupDurationMs = 0;
+  try {
+    emitProgress(onProgress, { stage: "scan_rollout_files", status: "start" });
+    const {
+      changes,
+      lockedPaths: lockedReadPaths,
+      providerCounts,
+      encryptedContentCounts
+    } = await collectSessionChanges(codexHome, targetProvider, { skipLockedReads: true });
+    const encryptedContentWarning = buildEncryptedContentWarning(encryptedContentCounts, targetProvider);
+    emitProgress(onProgress, {
+      stage: "scan_rollout_files",
+      status: "complete",
+      scannedChanges: changes.length,
+      lockedReadCount: lockedReadPaths.length
+    });
+
+    emitProgress(onProgress, { stage: "check_locked_rollout_files", status: "start" });
+    const {
+      writableChanges,
+      lockedChanges
+    } = await splitLockedSessionChanges(changes);
+    emitProgress(onProgress, {
+      stage: "check_locked_rollout_files",
+      status: "complete",
+      writableCount: writableChanges.length,
+      lockedCount: lockedChanges.length + lockedReadPaths.length
+    });
+
+    const skippedRolloutFiles = [...new Set([
+      ...lockedReadPaths,
+      ...lockedChanges.map((change) => change.path)
+    ])].sort((left, right) => left.localeCompare(right));
+    await assertSqliteWritable(codexHome, { busyTimeoutMs: sqliteBusyTimeoutMs });
+
+    emitProgress(onProgress, {
+      stage: "create_backup",
+      status: "start",
+      writableCount: writableChanges.length
+    });
+    const backupStartedAt = Date.now();
+    backupDir = await createBackup({
+      codexHome,
+      targetProvider,
+      sessionChanges: writableChanges,
+      configPath,
+      configBackupText
+    });
+    backupDurationMs = Date.now() - backupStartedAt;
+    emitProgress(onProgress, {
+      stage: "create_backup",
+      status: "complete",
+      backupDir,
+      durationMs: backupDurationMs
+    });
+
+    let sessionRestoreNeeded = false;
+    let appliedSessionChanges = [];
+    try {
+      let applyResult = { appliedChanges: 0, appliedPaths: [], skippedPaths: [] };
+      emitProgress(onProgress, { stage: "update_sqlite", status: "start" });
+      emitProgress(onProgress, {
+        stage: "rewrite_rollout_files",
+        status: "start",
+        writableCount: writableChanges.length
+      });
+      const sqliteResult = await updateSqliteProvider(
+        codexHome,
+        targetProvider,
+        async () => {
+          if (writableChanges.length === 0) {
+            return;
+          }
+          applyResult = await applySessionChanges(writableChanges);
+          const appliedPathSet = new Set(applyResult.appliedPaths ?? []);
+          appliedSessionChanges = writableChanges.filter((change) => appliedPathSet.has(change.path));
+          sessionRestoreNeeded = appliedSessionChanges.length > 0;
+          await updateSessionBackupManifest(backupDir, appliedSessionChanges);
+        },
+        { busyTimeoutMs: sqliteBusyTimeoutMs }
+      );
+      emitProgress(onProgress, {
+        stage: "rewrite_rollout_files",
+        status: "complete",
+        appliedChanges: applyResult.appliedChanges,
+        skippedChanges: applyResult.skippedPaths.length
+      });
+      emitProgress(onProgress, {
+        stage: "update_sqlite",
+        status: "complete",
+        updatedRows: sqliteResult.updatedRows
+      });
+      const skippedLockedRolloutFiles = [...new Set([
+        ...skippedRolloutFiles,
+        ...applyResult.skippedPaths
+      ])].sort((left, right) => left.localeCompare(right));
+      let autoPruneResult = null;
+      let autoPruneWarning = null;
+      emitProgress(onProgress, {
+        stage: "clean_backups",
+        status: "start",
+        keepCount
+      });
+      try {
+        autoPruneResult = await pruneBackups(codexHome, keepCount);
+      } catch (pruneError) {
+        autoPruneWarning = `Automatic backup cleanup failed: ${pruneError instanceof Error ? pruneError.message : String(pruneError)}`;
+      }
+      emitProgress(onProgress, {
+        stage: "clean_backups",
+        status: "complete",
+        deletedCount: autoPruneResult?.deletedCount ?? 0,
+        warning: autoPruneWarning
+      });
+      return {
+        codexHome,
+        targetProvider,
+        previousProvider: current.provider,
+        backupDir,
+        backupDurationMs,
+        changedSessionFiles: applyResult.appliedChanges,
+        skippedLockedRolloutFiles,
+        sqliteRowsUpdated: sqliteResult.updatedRows,
+        sqlitePresent: sqliteResult.databasePresent,
+        rolloutCountsBefore: summarizeProviderCounts(providerCounts),
+        encryptedContentCounts,
+        encryptedContentWarning,
+        autoPruneResult,
+        autoPruneWarning
+      };
+    } catch (error) {
+      if (sessionRestoreNeeded) {
+        try {
+          await restoreSessionChanges(appliedSessionChanges.map((change) => ({
+            path: change.path,
+            originalFirstLine: change.originalFirstLine,
+            originalSeparator: change.originalSeparator
+          })));
+        } catch (restoreError) {
+          throw new Error(
+            `Failed to restore rollout files after sync error. Original error: ${error.message}. Restore error: ${restoreError.message}`
+          );
+        }
+      }
+      throw error;
+    }
+  } finally {
+    await releaseLock();
+  }
+}
+
+export async function runSwitch({
+  codexHome: explicitCodexHome,
+  provider,
+  keepCount = DEFAULT_BACKUP_RETENTION_COUNT,
+  onProgress
+}) {
+  if (!provider) {
+    throw new Error("Missing provider id. Usage: codex-provider switch <provider-id>");
+  }
+
+  const codexHome = normalizeCodexHome(explicitCodexHome);
+  await ensureCodexHome(codexHome);
+  const configPath = path.join(codexHome, "config.toml");
+  const originalConfigText = await readConfigText(configPath);
+  if (!configDeclaresProvider(originalConfigText, provider)) {
+    throw new Error(`Provider "${provider}" is not available in config.toml. Configure it first or use one of: ${listConfiguredProviderIds(originalConfigText).join(", ")}`);
+  }
+
+  const nextConfigText = setRootProviderInConfigText(originalConfigText, provider);
+  emitProgress(onProgress, {
+    stage: "update_config",
+    status: "start",
+    provider
+  });
+  await writeConfigText(configPath, nextConfigText);
+  emitProgress(onProgress, {
+    stage: "update_config",
+    status: "complete",
+    provider
+  });
+
+  try {
+    const syncResult = await runSync({
+      codexHome,
+      provider,
+      configBackupText: originalConfigText,
+      keepCount,
+      onProgress
+    });
+    return {
+      ...syncResult,
+      configUpdated: true
+    };
+  } catch (error) {
+    await writeConfigText(configPath, originalConfigText);
+    throw error;
+  }
+}
+
+export async function runRestore({
+  codexHome: explicitCodexHome,
+  backupDir,
+  restoreConfig = true,
+  restoreDatabase = true,
+  restoreSessions = true
+}) {
+  if (!backupDir) {
+    throw new Error("Missing backup path. Usage: codex-provider restore <backup-dir>");
+  }
+  const codexHome = normalizeCodexHome(explicitCodexHome);
+  await ensureCodexHome(codexHome);
+  const releaseLock = await acquireLock(codexHome, "restore");
+  try {
+    return await restoreBackup(path.resolve(backupDir), codexHome, {
+      restoreConfig,
+      restoreDatabase,
+      restoreSessions
+    });
+  } finally {
+    await releaseLock();
+  }
+}
+
+export async function runPruneBackups({
+  codexHome: explicitCodexHome,
+  keepCount = DEFAULT_BACKUP_RETENTION_COUNT
+} = {}) {
+  if (!Number.isInteger(keepCount) || keepCount < 0) {
+    throw new Error(`Invalid keep count: ${keepCount}. Expected a non-negative integer.`);
+  }
+
+  const codexHome = normalizeCodexHome(explicitCodexHome);
+  await ensureCodexHome(codexHome);
+  const releaseLock = await acquireLock(codexHome, "prune-backups");
+  try {
+    return await pruneBackups(codexHome, keepCount);
+  } finally {
+    await releaseLock();
+  }
+}
+
+export { runWatch, runWatchOnce, runCoexist, runCoexistCleanup };

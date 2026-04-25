@@ -1,0 +1,17 @@
+{
+  "name": "codex-provider-gui",
+  "version": "1.0.0",
+  "description": "Mac GUI for codex-provider-sync",
+  "type": "module",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.10.1"
+  }
+}

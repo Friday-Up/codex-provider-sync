@@ -1,0 +1,35 @@
+{
+  "name": "codex-provider-sync",
+  "version": "0.2.2",
+  "description": "Synchronize Codex session provider metadata across rollout files and SQLite state.",
+  "type": "module",
+  "files": [
+    "README.md",
+    "README_EN.md",
+    "README_ZH.md",
+    "AGENTS.md",
+    "src"
+  ],
+  "bin": {
+    "codex-provider": "./src/cli.js"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "keywords": [
+    "codex",
+    "sqlite",
+    "sessions",
+    "provider"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.10.1"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.10.1"
+  }
+}
