@@ -30,9 +30,15 @@ Codex CLI 支持两种登录方式：**OpenAI 官方 OAuth** 和 **第三方 API
 
 <div align="center">
 
-<img src="screenshots/gui-preview.png" alt="GUI 界面预览" width="720">
+<img src="screenshots/gui-main.png" alt="GUI 主界面" width="720">
 
-*macOS GUI 界面——一键同步会话历史*
+*主界面——查看当前状态与 provider 分布*
+
+<br>
+
+<img src="screenshots/gui-operations.png" alt="GUI 操作界面" width="720">
+
+*操作界面——一键同步会话历史与备份恢复*
 
 </div>
 
