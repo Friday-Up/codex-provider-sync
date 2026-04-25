@@ -1,6 +1,6 @@
 [package]
 name = "codex-provider-gui"
-version = "1.0.0"
+version = "1.0.1"
 description = "Mac GUI for codex-provider-sync"
 authors = ["you"]
 edition = "2021"
