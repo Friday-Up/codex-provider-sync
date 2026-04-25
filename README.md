@@ -118,3 +118,7 @@ codex-provider switch openai
 ## License
 
 MIT
+
+---
+
+由 [Friday Up](https://github.com/Friday-Up) 维护
