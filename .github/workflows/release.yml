@@ -42,3 +42,28 @@ jobs:
           files: |
             codex-provider-gui/src-tauri/target/release/bundle/**/*.dmg
             codex-provider-gui/src-tauri/target/release/bundle/**/*.app
+
+  build-windows:
+    needs: create-release
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install dependencies
+        working-directory: ./codex-provider-gui
+        run: npm ci
+      - name: Build Tauri App
+        working-directory: ./codex-provider-gui
+        run: npm run tauri build
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            codex-provider-gui/src-tauri/target/release/bundle/**/*.msi
+            codex-provider-gui/src-tauri/target/release/bundle/**/*.exe
