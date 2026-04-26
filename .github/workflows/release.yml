@@ -60,14 +60,21 @@ jobs:
       - name: Install dependencies
         working-directory: ./codex-provider-gui
         run: npm ci
-      - name: Build Tauri App
+      - name: Build Tauri App (MSI)
         working-directory: ./codex-provider-gui
         shell: pwsh
         run: |
           $env:TAURI_SIGNING_PRIVATE_KEY = ""
           npm run tauri build -- --target x86_64-pc-windows-msvc --bundles msi
+      - name: Build Tauri App (EXE)
+        working-directory: ./codex-provider-gui
+        shell: pwsh
+        run: |
+          $env:TAURI_SIGNING_PRIVATE_KEY = ""
+          npm run tauri build -- --target x86_64-pc-windows-msvc --bundles nsis
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             codex-provider-gui/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/**/*.msi
+            codex-provider-gui/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/**/*.exe
