@@ -175,7 +175,7 @@ A: 请确保同步前已关闭 Codex App，同步完成后再重新打开。
 A: 可以，使用 **从备份恢复** 功能，或运行 `codex-provider restore <备份路径>`。
 
 **Q: 支持 Windows 吗？**  
-A: CLI 工具支持 Windows。GUI 目前主要面向 macOS，Windows 版本正在开发中。
+A: 支持。CLI 工具跨平台可用，GUI 提供 macOS（.dmg）和 Windows（.msi / .exe）两种安装包。
 
 ## 开发
 
