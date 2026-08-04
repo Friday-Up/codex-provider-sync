@@ -8,6 +8,8 @@ import { installWindowsLauncher } from "./launcher.js";
 import {
   getStatus,
   renderStatus,
+  runBackup,
+  runListBackups,
   runPruneBackups,
   runRestore,
   runSwitch,
@@ -23,12 +25,14 @@ function printHelp() {
 
 Usage:
   codex-provider status [--codex-home PATH]
-  codex-provider sync [--provider ID] [--keep N] [--codex-home PATH]
-  codex-provider switch <provider-id> [--keep N] [--codex-home PATH]
+  codex-provider sync [--from ID] [--to ID | --provider ID] [--model ID] [--repair-models] [--keep N] [--codex-home PATH]
+  codex-provider switch <provider-id> [--model ID] [--repair-models] [--keep N] [--codex-home PATH]
   codex-provider watch [--provider ID] [--mode rewrite|coexist] [--codex-home PATH]
   codex-provider watch-once [--provider ID] [--mode rewrite|coexist] [--codex-home PATH]
   codex-provider coexist [--codex-home PATH]
   codex-provider coexist-cleanup [--codex-home PATH]
+  codex-provider backup [--keep N] [--codex-home PATH]
+  codex-provider list-backups [--json] [--codex-home PATH]
   codex-provider prune-backups [--keep N] [--codex-home PATH]
   codex-provider restore <backup-dir> [--no-config] [--no-db] [--no-sessions] [--codex-home PATH]
   codex-provider install-windows-launcher [--dir PATH] [--codex-home PATH]
@@ -66,6 +70,13 @@ function parseArgs(argv) {
 function summarizeSync(result, label) {
   const lines = [
     `${label} provider: ${result.targetProvider}`,
+    `同步范围: ${result.sourceProvider ? `仅 ${result.sourceProvider} 的会话` : "全部会话"}`,
+    ...(result.targetModel
+      ? [
+          `目标模型: ${result.targetModel}`,
+          `模型已重写: ${result.modelRewrittenSessionFiles ?? 0} 个会话`
+        ]
+      : []),
     `Codex 主目录: ${result.codexHome}`,
     `备份目录: ${result.backupDir}`,
     `备份耗时: ${formatDuration(result.backupDurationMs ?? 0)}`,
@@ -99,6 +110,31 @@ function summarizePrune(result) {
     `剩余备份: ${result.remainingCount} 个`,
     `释放空间: ${formatBytes(result.freedBytes)}`
   ].join("\n");
+}
+
+function summarizeBackup(result) {
+  const lines = [
+    `备份类型: 手动一键备份`,
+    `备份目录: ${result.backupDir}`,
+    `备份耗时: ${formatDuration(result.backupDurationMs ?? 0)}`,
+    `会话文件快照: ${result.sessionFilesSnapshot} 个`,
+    `Codex 主目录: ${result.codexHome}`
+  ];
+  if (result.skippedLockedRolloutFiles?.length) {
+    const preview = result.skippedLockedRolloutFiles.slice(0, 5).join(", ");
+    const extraCount = result.skippedLockedRolloutFiles.length - Math.min(result.skippedLockedRolloutFiles.length, 5);
+    lines.push(`跳过锁定的会话文件: ${result.skippedLockedRolloutFiles.length} 个`);
+    lines.push(`锁定文件: ${preview}${extraCount > 0 ? ` (+${extraCount} 个更多)` : ""}`);
+  }
+  if (result.autoPruneResult) {
+    lines.push(
+      `备份清理: 已删除 ${result.autoPruneResult.deletedCount} 个，剩余 ${result.autoPruneResult.remainingCount} 个，释放 ${formatBytes(result.autoPruneResult.freedBytes)}`
+    );
+  }
+  if (result.autoPruneWarning) {
+    lines.push(`备份清理警告: ${result.autoPruneWarning}`);
+  }
+  return lines.join("\n");
 }
 
 function formatBytes(bytes) {
@@ -194,7 +230,10 @@ async function main() {
   if (command === "sync") {
     const result = await runSync({
       codexHome: flags["codex-home"],
-      provider: flags.provider,
+      provider: flags.to ?? flags.provider,
+      sourceProvider: flags.from,
+      model: flags.model,
+      repairModels: Boolean(flags["repair-models"]),
       keepCount: parseKeepCount(flags.keep),
       onProgress: createSyncProgressReporter()
     });
@@ -207,6 +246,8 @@ async function main() {
     const result = await runSwitch({
       codexHome: flags["codex-home"],
       provider,
+      model: flags.model,
+      repairModels: Boolean(flags["repair-models"]),
       keepCount: parseKeepCount(flags.keep),
       onProgress: createSyncProgressReporter()
     });
@@ -223,6 +264,32 @@ async function main() {
     return;
   }
 
+  if (command === "backup") {
+    const result = await runBackup({
+      codexHome: flags["codex-home"],
+      keepCount: parseKeepCount(flags.keep),
+      onProgress: createSyncProgressReporter()
+    });
+    console.log(summarizeBackup(result));
+    return;
+  }
+
+  if (command === "list-backups") {
+    const result = await runListBackups({ codexHome: flags["codex-home"] });
+    if (flags.json) {
+      console.log(JSON.stringify(result.backups));
+      return;
+    }
+    console.log(`备份根目录: ${result.backupRoot}`);
+    console.log(`备份数量: ${result.backups.length}`);
+    for (const backup of result.backups) {
+      const typeLabel = backup.backupType === "manual" ? "手动一键备份" : "同步自动备份";
+      console.log(`${backup.name} | ${typeLabel} | ${backup.createdAt ?? "未知时间"} | ${backup.changedSessionFiles} 个会话文件 | ${formatBytes(backup.totalBytes)}`);
+      console.log(`  目录: ${backup.fullPath}`);
+    }
+    return;
+  }
+
   if (command === "restore") {
     const backupDir = positionals[1] ?? flags.backup;
     const result = await runRestore({
@@ -234,7 +301,11 @@ async function main() {
     });
     console.log(`已从备份恢复: ${path.resolve(backupDir)}`);
     console.log(`Codex 主目录: ${result.codexHome}`);
-    console.log(`备份时的 provider: ${result.targetProvider}`);
+    console.log(`备份类型: ${result.backupType === "manual" ? "手动一键备份" : "同步自动备份"}`);
+    console.log(`备份时的 provider: ${result.targetProvider ?? "未指定（手动备份）"}`);
+    if (result.sourceProvider) {
+      console.log(`备份时的来源 provider: ${result.sourceProvider}`);
+    }
     return;
   }
 

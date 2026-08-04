@@ -36,27 +36,53 @@
 
       <section class="sync-section">
         <h2>同步历史会话</h2>
-        <p class="hint">
-          选择目标 provider，工具会把所有历史会话迁移到该 provider。
-        </p>
+        <p class="hint">自由选择来源与目标 provider，仅把指定来源的会话迁移到目标 provider。</p>
         <div class="sync-options">
-          <button id="btn-sync-openai" class="btn btn-success sync-option-btn">
-            <span class="sync-option-title">同步到 OpenAI 官方 OAuth</span>
-            <span class="sync-option-desc">将所有会话的 provider 改为 openai</span>
-          </button>
-          <button id="btn-sync-custom" class="btn btn-success sync-option-btn">
-            <span class="sync-option-title">同步到第三方 API Key</span>
-            <span class="sync-option-desc">将所有会话的 provider 改为 custom</span>
-          </button>
+          <div class="sync-picker">
+            <div class="sync-picker-field">
+              <label for="sync-from">来源 provider</label>
+              <select id="sync-from">
+                <option value="">全部（所有会话）</option>
+              </select>
+            </div>
+            <div class="sync-picker-arrow">→</div>
+            <div class="sync-picker-field">
+              <label for="sync-to">目标 provider</label>
+              <select id="sync-to"></select>
+            </div>
+            <div class="sync-picker-field">
+              <label for="sync-model">目标模型（可选）</label>
+              <input type="text" id="sync-model" placeholder="留空则自动取配置中的模型">
+            </div>
+            <button id="btn-sync" class="btn btn-success">执行同步</button>
+          </div>
+          <label class="sync-repair-label">
+            <input type="checkbox" id="sync-repair">
+            同时修复已为目标 provider 的会话模型（处理切换后模型名不匹配导致的续会话报错）
+          </label>
+          <p class="hint small">
+            选择"全部"时等同于原来的行为：把所有非目标 provider 的会话都迁移到目标 provider。
+          </p>
         </div>
       </section>
 
       <section class="restore-section">
-        <h2>从备份恢复</h2>
-        <p class="hint">如果同步出错，可以从之前的备份恢复。</p>
+        <h2>备份与恢复</h2>
+        <p class="hint">一键备份当前 Codex 状态（config.toml + SQLite + 会话元数据），误操作后可随时恢复。</p>
+        <button id="btn-backup" class="btn btn-primary">一键备份</button>
+        <hr class="section-divider">
+        <h3 class="subsection-title">从备份恢复</h3>
+        <p class="hint">从下拉框选择此前的一键备份，或手动输入备份目录路径。</p>
         <div class="input-group">
-          <label for="backup-dir">备份目录路径：</label>
-          <input type="text" id="backup-dir" placeholder="例如：/Users/xxx/.codex/backups_state/provider-sync/2026...">
+          <label for="backup-select">选择备份：</label>
+          <select id="backup-select">
+            <option value="">手动输入路径</option>
+          </select>
+          <button id="btn-refresh-backups" class="btn btn-small">刷新备份列表</button>
+        </div>
+        <div class="input-group" id="backup-manual-group">
+          <label for="backup-dir">或手动输入备份目录路径：</label>
+          <input type="text" id="backup-dir" placeholder="例如：C:\Users\xxx\.codex\backups_state\provider-sync\2026...">
         </div>
         <button id="btn-restore" class="btn btn-warning">恢复备份</button>
       </section>

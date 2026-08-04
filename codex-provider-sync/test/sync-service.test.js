@@ -13,9 +13,11 @@ import {
   restoreBackup,
   updateSessionBackupManifest
 } from "../src/backup.js";
-import { getStatus, renderStatus, runRestore, runSwitch, runSync } from "../src/service.js";
+import { getStatus, renderStatus, runBackup, runListBackups, runRestore, runSwitch, runSync } from "../src/service.js";
 import { DEFAULT_BACKUP_RETENTION_COUNT } from "../src/constants.js";
 import { applySessionChanges, collectSessionChanges } from "../src/session-files.js";
+import { readSqliteProviderCounts } from "../src/sqlite-state.js";
+import { resolveProviderModel } from "../src/config-file.js";
 
 async function makeTempCodexHome() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-provider-sync-"));
@@ -45,6 +47,45 @@ async function writeCustomRollout(filePath, payload, message = "hi") {
   const lines = [
     JSON.stringify({ timestamp: payload.timestamp, type: "session_meta", payload }),
     JSON.stringify({ timestamp: payload.timestamp, type: "event_msg", payload: { type: "user_message", message } })
+  ];
+  await fs.writeFile(filePath, `${lines.join("\n")}\n`, "utf8");
+}
+
+async function writeRolloutWithModel(filePath, id, provider, model) {
+  const payload = {
+    id,
+    timestamp: "2026-03-19T00:00:00.000Z",
+    cwd: "C:\\AITemp",
+    source: "cli",
+    cli_version: "0.115.0",
+    model_provider: provider
+  };
+  const lines = [
+    JSON.stringify({ timestamp: payload.timestamp, type: "session_meta", payload }),
+    JSON.stringify({
+      timestamp: payload.timestamp,
+      type: "event_msg",
+      payload: {
+        type: "thread_settings",
+        thread_settings: {
+          model,
+          model_provider_id: provider,
+          reasoning_effort: "high"
+        }
+      }
+    }),
+    JSON.stringify({
+      timestamp: payload.timestamp,
+      type: "turn_context",
+      payload: {
+        turn_id: "turn-1",
+        cwd: payload.cwd,
+        model,
+        effort: "high",
+        summary: "包含中文与 Unicode 内容 ✓ 保持不变"
+      }
+    }),
+    JSON.stringify({ timestamp: payload.timestamp, type: "event_msg", payload: { type: "user_message", message: "hi" } })
   ];
   await fs.writeFile(filePath, `${lines.join("\n")}\n`, "utf8");
 }
@@ -95,14 +136,27 @@ async function writeStateDb(codexHome, rows) {
       CREATE TABLE threads (
         id TEXT PRIMARY KEY,
         model_provider TEXT,
+        model TEXT,
         archived INTEGER NOT NULL DEFAULT 0,
         first_user_message TEXT NOT NULL DEFAULT ''
       )
     `);
-    const stmt = db.prepare("INSERT INTO threads (id, model_provider, archived, first_user_message) VALUES (?, ?, ?, ?)");
+    const stmt = db.prepare("INSERT INTO threads (id, model_provider, model, archived, first_user_message) VALUES (?, ?, ?, ?, ?)");
     for (const row of rows) {
-      stmt.run(row.id, row.model_provider, row.archived ? 1 : 0, row.first_user_message ?? "hello");
+      stmt.run(row.id, row.model_provider, row.model ?? null, row.archived ? 1 : 0, row.first_user_message ?? "hello");
     }
+  } finally {
+    db.close();
+  }
+}
+
+function readThreadModels(codexHome) {
+  const dbPath = path.join(codexHome, "state_5.sqlite");
+  const db = new DatabaseSync(dbPath);
+  try {
+    return Object.fromEntries(
+      db.prepare("SELECT id, model FROM threads").all().map((row) => [row.id, row.model])
+    );
   } finally {
     db.close();
   }
@@ -613,7 +667,7 @@ test("status skips locked rollout files without failing", async () => {
   try {
     const status = await getStatus({ codexHome });
     assert.deepEqual(status.lockedRolloutFiles, [sessionPath]);
-    assert.match(renderStatus(status), /Locked rollout files skipped during status scan: 1/);
+    assert.match(renderStatus(status), /跳过的锁定文件: 1 个/);
   } finally {
     lockProcess.kill();
     await new Promise((resolve) => lockProcess.once("exit", resolve));
@@ -706,6 +760,279 @@ test("runSync uses a custom automatic backup retention count", async () => {
   assert.equal(result.autoPruneWarning, null);
 });
 
+test("collectSessionChanges filters changes by source provider", async () => {
+  const { codexHome } = await makeTempCodexHome();
+  const openaiPath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-src-filter-openai.jsonl");
+  const customPath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-src-filter-custom.jsonl");
+  await writeRollout(openaiPath, "src-filter-openai", "openai");
+  await writeRollout(customPath, "src-filter-custom", "custom");
+
+  const all = await collectSessionChanges(codexHome, "deepseek", {});
+  assert.equal(all.changes.length, 2);
+
+  const fromOpenai = await collectSessionChanges(codexHome, "deepseek", { sourceProvider: "openai" });
+  assert.equal(fromOpenai.changes.length, 1);
+  assert.equal(fromOpenai.changes[0].originalProvider, "openai");
+  assert.equal(fromOpenai.providerCounts.sessions.get("openai"), 1);
+  assert.equal(fromOpenai.providerCounts.sessions.has("custom"), false);
+
+  const fromMissing = await collectSessionChanges(codexHome, "deepseek", { sourceProvider: "(missing)" });
+  assert.equal(fromMissing.changes.length, 0);
+});
+
+test("runSync with sourceProvider converts only matching sessions", async () => {
+  const { codexHome } = await makeTempCodexHome();
+  await writeConfig(codexHome, 'model_provider = "openai"');
+  const openaiPath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-src-openai.jsonl");
+  const customPath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-src-custom.jsonl");
+  await writeRollout(openaiPath, "src-openai", "openai");
+  await writeRollout(customPath, "src-custom", "custom");
+  await writeStateDb(codexHome, [
+    { id: "src-openai", model_provider: "openai", archived: false },
+    { id: "src-custom", model_provider: "custom", archived: false }
+  ]);
+
+  const result = await runSync({ codexHome, provider: "deepseek", sourceProvider: "openai" });
+
+  assert.equal(result.targetProvider, "deepseek");
+  assert.equal(result.sourceProvider, "openai");
+  assert.equal(result.changedSessionFiles, 1);
+  assert.equal(result.sqliteRowsUpdated, 1);
+
+  const openaiText = await fs.readFile(openaiPath, "utf8");
+  const customText = await fs.readFile(customPath, "utf8");
+  assert.match(openaiText, /"model_provider":"deepseek"/);
+  assert.match(customText, /"model_provider":"custom"/);
+
+  const sqliteCounts = await readSqliteProviderCounts(codexHome);
+  assert.deepEqual(sqliteCounts.sessions, { custom: 1, deepseek: 1 });
+});
+
+test("cli sync --from/--to converts only the selected source", async () => {
+  const { codexHome } = await makeTempCodexHome();
+  await writeConfig(codexHome, 'model_provider = "openai"');
+  const openaiPath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-cli-src-openai.jsonl");
+  const customPath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-cli-src-custom.jsonl");
+  await writeRollout(openaiPath, "cli-src-openai", "openai");
+  await writeRollout(customPath, "cli-src-custom", "custom");
+
+  const result = await runCli(["sync", "--from", "openai", "--to", "deepseek", "--codex-home", codexHome]);
+
+  assert.equal(result.code, 0);
+  assert.match(result.stdout, /已同步 provider: deepseek/);
+  assert.match(result.stdout, /同步范围: 仅 openai 的会话/);
+  assert.match(result.stdout, /已更新会话文件: 1 个/);
+
+  const openaiText = await fs.readFile(openaiPath, "utf8");
+  const customText = await fs.readFile(customPath, "utf8");
+  assert.match(openaiText, /"model_provider":"deepseek"/);
+  assert.match(customText, /"model_provider":"custom"/);
+});
+
+test("resolveProviderModel prefers explicit, then provider section, then root model", () => {
+  const configText = [
+    'model_provider = "deepseek"',
+    'model = "deepseek-v4-flash"',
+    "",
+    "[model_providers.custom]",
+    'name = "custom"',
+    'model = "custom-model"',
+    ""
+  ].join("\n");
+
+  assert.equal(resolveProviderModel(configText, "custom", "explicit-model"), "explicit-model");
+  assert.equal(resolveProviderModel(configText, "custom"), "custom-model");
+  assert.equal(resolveProviderModel(configText, "deepseek"), "deepseek-v4-flash");
+  assert.equal(resolveProviderModel(configText, "openai"), null);
+});
+
+test("collectSessionChanges collects model line updates for target provider", async () => {
+  const { codexHome } = await makeTempCodexHome();
+  const openaiPath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-model-openai.jsonl");
+  const customPath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-model-custom.jsonl");
+  await writeRolloutWithModel(openaiPath, "model-openai", "openai", "gpt-5.6-sol");
+  await writeRolloutWithModel(customPath, "model-custom", "custom", "deepseek-chat");
+
+  const result = await collectSessionChanges(codexHome, "deepseek", {
+    targetModel: "deepseek-v4-flash",
+    sourceProvider: "openai"
+  });
+
+  const change = result.changes.find((entry) => entry.path === openaiPath);
+  assert.ok(change);
+  assert.ok(change.modelLineUpdates.length >= 2);
+  const turnUpdate = change.modelLineUpdates.find((update) => update.text.includes("turn_context"));
+  assert.match(turnUpdate.text, /"model":"deepseek-v4-flash"/);
+  assert.match(turnUpdate.text, /包含中文与 Unicode 内容/);
+  const settingsUpdate = change.modelLineUpdates.find((update) => update.text.includes("thread_settings"));
+  assert.match(settingsUpdate.text, /"model":"deepseek-v4-flash"/);
+  assert.match(settingsUpdate.text, /"model_provider_id":"deepseek"/);
+
+  const customChange = result.changes.find((entry) => entry.path === customPath);
+  assert.equal(customChange, undefined);
+});
+
+test("runSync rewrites model fields and restore reverts them", async () => {
+  const { codexHome } = await makeTempCodexHome();
+  await writeConfig(codexHome, 'model_provider = "deepseek"\nmodel = "deepseek-v4-flash"');
+  const openaiPath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-sync-model-openai.jsonl");
+  await writeRolloutWithModel(openaiPath, "sync-model-openai", "openai", "gpt-5.6-sol");
+  await writeStateDb(codexHome, [
+    { id: "sync-model-openai", model_provider: "openai", model: "gpt-5.6-sol", archived: false }
+  ]);
+
+  const result = await runSync({ codexHome, provider: "deepseek", model: "deepseek-v4-flash" });
+
+  assert.equal(result.targetModel, "deepseek-v4-flash");
+  assert.equal(result.modelRewrittenSessionFiles, 1);
+  assert.equal((await readThreadModels(codexHome))["sync-model-openai"], "deepseek-v4-flash");
+  const syncedText = await fs.readFile(openaiPath, "utf8");
+  assert.match(syncedText, /"model":"deepseek-v4-flash"/);
+  assert.match(syncedText, /"model_provider_id":"deepseek"/);
+  assert.doesNotMatch(syncedText, /gpt-5\.6-sol/);
+
+  await runRestore({ codexHome, backupDir: result.backupDir });
+  const restoredText = await fs.readFile(openaiPath, "utf8");
+  assert.match(restoredText, /"model":"gpt-5\.6-sol"/);
+  assert.match(restoredText, /"model_provider_id":"openai"/);
+  assert.equal((await readThreadModels(codexHome))["sync-model-openai"], "gpt-5.6-sol");
+});
+
+test("runSync with repairModels fixes model fields of sessions already at the target provider", async () => {
+  const { codexHome } = await makeTempCodexHome();
+  await writeConfig(codexHome, 'model_provider = "deepseek"\nmodel = "deepseek-v4-flash"');
+  const deepseekPath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-repair-deepseek.jsonl");
+  await writeRolloutWithModel(deepseekPath, "repair-deepseek", "deepseek", "gpt-5.6-sol");
+  await writeStateDb(codexHome, [
+    { id: "repair-deepseek", model_provider: "deepseek", model: "gpt-5.6-sol", archived: false }
+  ]);
+
+  const withoutRepair = await runSync({ codexHome, provider: "deepseek" });
+  assert.equal(withoutRepair.changedSessionFiles, 0);
+  assert.equal((await readThreadModels(codexHome))["repair-deepseek"], "gpt-5.6-sol");
+  let text = await fs.readFile(deepseekPath, "utf8");
+  assert.match(text, /"model":"gpt-5\.6-sol"/);
+
+  const withRepair = await runSync({ codexHome, provider: "deepseek", repairModels: true });
+  assert.equal(withRepair.modelRewrittenSessionFiles, 1);
+  assert.equal((await readThreadModels(codexHome))["repair-deepseek"], "deepseek-v4-flash");
+  text = await fs.readFile(deepseekPath, "utf8");
+  assert.match(text, /"model":"deepseek-v4-flash"/);
+  assert.doesNotMatch(text, /gpt-5\.6-sol/);
+});
+
+test("cli sync --model --repair-models rewrites models", async () => {
+  const { codexHome } = await makeTempCodexHome();
+  await writeConfig(codexHome, 'model_provider = "deepseek"\nmodel = "deepseek-v4-flash"');
+  const deepseekPath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-cli-repair.jsonl");
+  await writeRolloutWithModel(deepseekPath, "cli-repair", "deepseek", "gpt-5.6-sol");
+
+  const result = await runCli([
+    "sync",
+    "--provider",
+    "deepseek",
+    "--model",
+    "deepseek-v4-pro",
+    "--repair-models",
+    "--codex-home",
+    codexHome
+  ]);
+
+  assert.equal(result.code, 0);
+  assert.match(result.stdout, /目标模型: deepseek-v4-pro/);
+  assert.match(result.stdout, /模型已重写: 1 个会话/);
+  const text = await fs.readFile(deepseekPath, "utf8");
+  assert.match(text, /"model":"deepseek-v4-pro"/);
+});
+
+test("runBackup snapshots config, sqlite and all session files, then restore reverts state", async () => {
+  const { codexHome } = await makeTempCodexHome();
+  await writeConfig(codexHome, 'model_provider = "openai"');
+  const openaiPath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-backup-openai.jsonl");
+  const customPath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-backup-custom.jsonl");
+  await writeRollout(openaiPath, "backup-openai", "openai");
+  await writeRollout(customPath, "backup-custom", "custom");
+  await writeStateDb(codexHome, [
+    { id: "backup-openai", model_provider: "openai", archived: false },
+    { id: "backup-custom", model_provider: "custom", archived: false }
+  ]);
+
+  const backupResult = await runBackup({ codexHome });
+
+  assert.equal(backupResult.backupType, "manual");
+  assert.equal(backupResult.sessionFilesSnapshot, 2);
+  await fs.access(backupResult.backupDir);
+
+  await runSync({ codexHome, provider: "deepseek" });
+  const syncedOpenaiText = await fs.readFile(openaiPath, "utf8");
+  assert.match(syncedOpenaiText, /"model_provider":"deepseek"/);
+
+  await runRestore({ codexHome, backupDir: backupResult.backupDir });
+
+  const openaiText = await fs.readFile(openaiPath, "utf8");
+  const customText = await fs.readFile(customPath, "utf8");
+  assert.match(openaiText, /"model_provider":"openai"/);
+  assert.match(customText, /"model_provider":"custom"/);
+
+  const sqliteCounts = await readSqliteProviderCounts(codexHome);
+  assert.deepEqual(sqliteCounts.sessions, { custom: 1, openai: 1 });
+});
+
+test("cli backup creates a manual backup", async () => {
+  const { codexHome } = await makeTempCodexHome();
+  await writeConfig(codexHome, 'model_provider = "openai"');
+  const sessionPath = path.join(codexHome, "sessions", "2026", "03", "19", "rollout-cli-backup.jsonl");
+  await writeRollout(sessionPath, "cli-backup", "openai");
+
+  const result = await runCli(["backup", "--codex-home", codexHome]);
+
+  assert.equal(result.code, 0);
+  assert.match(result.stdout, /备份类型: 手动一键备份/);
+  assert.match(result.stdout, /会话文件快照: 1 个/);
+  assert.match(result.stdout, /备份目录: /);
+});
+
+test("runListBackups lists backups with type and metadata", async () => {
+  const { codexHome } = await makeTempCodexHome();
+  await writeConfig(codexHome, 'model_provider = "openai"');
+  await writeRollout(
+    path.join(codexHome, "sessions", "2026", "03", "19", "rollout-list-backups.jsonl"),
+    "list-backups",
+    "openai"
+  );
+
+  const manualBackup = await runBackup({ codexHome });
+  await writeBackup(codexHome, "20260101T000000000Z", [["note.txt", "old"]]);
+
+  const result = await runListBackups({ codexHome });
+
+  assert.equal(result.backups.length, 2);
+  assert.equal(result.backups[0].fullPath, manualBackup.backupDir);
+  assert.equal(result.backups[0].backupType, "manual");
+  assert.equal(result.backups[0].changedSessionFiles, 1);
+  assert.equal(result.backups[1].backupType, "sync");
+  assert.equal(result.backups[1].name, "20260101T000000000Z");
+});
+
+test("cli list-backups --json returns parseable backup entries", async () => {
+  const { codexHome } = await makeTempCodexHome();
+  await writeConfig(codexHome, 'model_provider = "openai"');
+  await writeRollout(
+    path.join(codexHome, "sessions", "2026", "03", "19", "rollout-cli-list-backups.jsonl"),
+    "cli-list-backups",
+    "openai"
+  );
+  await runBackup({ codexHome });
+
+  const result = await runCli(["list-backups", "--json", "--codex-home", codexHome]);
+
+  assert.equal(result.code, 0);
+  const parsed = JSON.parse(result.stdout);
+  assert.equal(parsed.length, 1);
+  assert.equal(parsed[0].backupType, "manual");
+  assert.equal(parsed[0].changedSessionFiles, 1);
+});
+
 test("cli rejects non-integer keep values", async () => {
   const result = await runCli(["prune-backups", "--keep", "1.5"]);
   assert.equal(result.code, 1);
@@ -723,12 +1050,12 @@ test("cli sync prints stage progress and backup timing", async () => {
 
   const result = await runCli(["sync", "--codex-home", codexHome]);
   assert.equal(result.code, 0);
-  assert.match(result.stdout, /\[1\/6\] Scanning rollout files\.\.\./);
-  assert.match(result.stdout, /\[2\/6\] Checking locked rollout files\.\.\./);
-  assert.match(result.stdout, /\[3\/6\] Creating backup\.\.\./);
-  assert.match(result.stdout, /\[4\/6\] Updating SQLite\.\.\./);
-  assert.match(result.stdout, /\[5\/6\] Rewriting rollout files\.\.\./);
-  assert.match(result.stdout, /\[6\/6\] Cleaning backups\.\.\./);
-  assert.match(result.stdout, /Backup created in .*: .+/);
-  assert.match(result.stdout, /Backup creation time: /);
+  assert.match(result.stdout, /\[1\/6\] 正在扫描会话文件\.\.\./);
+  assert.match(result.stdout, /\[2\/6\] 正在检查锁定的会话文件\.\.\./);
+  assert.match(result.stdout, /\[3\/6\] 正在创建备份\.\.\./);
+  assert.match(result.stdout, /\[4\/6\] 正在更新 SQLite 数据库\.\.\./);
+  assert.match(result.stdout, /\[5\/6\] 正在重写会话文件\.\.\./);
+  assert.match(result.stdout, /\[6\/6\] 正在清理备份\.\.\./);
+  assert.match(result.stdout, /备份已创建，耗时 .*: .+/);
+  assert.match(result.stdout, /备份耗时: /);
 });

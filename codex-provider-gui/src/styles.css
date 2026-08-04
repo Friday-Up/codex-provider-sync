@@ -189,6 +189,85 @@ section h2 {
   font-weight: 400;
 }
 
+.sync-picker {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.sync-picker-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sync-picker-field label {
+  font-size: 13px;
+  font-weight: 500;
+  color: #333;
+}
+
+.sync-picker-field select {
+  padding: 8px 12px;
+  border: 1px solid #d2d2d7;
+  border-radius: 6px;
+  font-size: 14px;
+  background: #fff;
+  outline: none;
+  min-width: 170px;
+}
+
+.sync-picker-field select:focus {
+  border-color: #0071e3;
+}
+
+.sync-picker-field input {
+  padding: 8px 12px;
+  border: 1px solid #d2d2d7;
+  border-radius: 6px;
+  font-size: 14px;
+  outline: none;
+  width: 170px;
+}
+
+.sync-picker-field input:focus {
+  border-color: #0071e3;
+}
+
+.sync-repair-label {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 12px;
+  color: #666;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.sync-repair-label input {
+  margin-top: 2px;
+}
+
+.sync-picker-arrow {
+  font-size: 20px;
+  color: #86868b;
+  padding-bottom: 8px;
+}
+
+.section-divider {
+  border: none;
+  border-top: 1px solid #e5e5ea;
+  margin: 16px 0;
+}
+
+.subsection-title {
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 8px;
+  color: #1d1d1f;
+}
+
 footer {
   text-align: center;
   padding: 20px 0;

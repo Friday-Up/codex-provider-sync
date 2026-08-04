@@ -178,6 +178,8 @@ codex-provider status
 codex-provider sync
 codex-provider sync --keep 5
 codex-provider sync --provider openai
+codex-provider sync --from custom --to deepseek
+codex-provider backup
 codex-provider switch apigather
 codex-provider prune-backups --keep 5
 codex-provider install-windows-launcher

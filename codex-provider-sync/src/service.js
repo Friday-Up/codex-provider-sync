@@ -12,12 +12,14 @@ import {
   listConfiguredProviderIds,
   readConfigText,
   readCurrentProviderFromConfigText,
+  resolveProviderModel,
   setRootProviderInConfigText,
   writeConfigText
 } from "./config-file.js";
 import {
   createBackup,
   getBackupSummary,
+  listBackups,
   pruneBackups,
   restoreBackup,
   updateSessionBackupManifest
@@ -25,6 +27,7 @@ import {
 import { acquireLock } from "./locking.js";
 import {
   applySessionChanges,
+  collectSessionBackupSnapshot,
   collectSessionChanges,
   restoreSessionChanges,
   splitLockedSessionChanges,
@@ -160,6 +163,9 @@ export function renderStatus(status) {
 export async function runSync({
   codexHome: explicitCodexHome,
   provider,
+  model,
+  repairModels = false,
+  sourceProvider,
   configBackupText,
   keepCount = DEFAULT_BACKUP_RETENTION_COUNT,
   sqliteBusyTimeoutMs,
@@ -175,6 +181,7 @@ export async function runSync({
   const configText = await readConfigText(configPath);
   const current = readCurrentProviderFromConfigText(configText);
   const targetProvider = provider ?? current.provider ?? DEFAULT_PROVIDER;
+  const targetModel = resolveProviderModel(configText, targetProvider, model);
 
   const releaseLock = await acquireLock(codexHome, "sync");
   let backupDir = null;
@@ -186,7 +193,12 @@ export async function runSync({
       lockedPaths: lockedReadPaths,
       providerCounts,
       encryptedContentCounts
-    } = await collectSessionChanges(codexHome, targetProvider, { skipLockedReads: true });
+    } = await collectSessionChanges(codexHome, targetProvider, {
+      skipLockedReads: true,
+      sourceProvider,
+      targetModel,
+      repairModels
+    });
     const encryptedContentWarning = buildEncryptedContentWarning(encryptedContentCounts, targetProvider);
     emitProgress(onProgress, {
       stage: "scan_rollout_files",
@@ -222,6 +234,7 @@ export async function runSync({
     backupDir = await createBackup({
       codexHome,
       targetProvider,
+      sourceProvider,
       sessionChanges: writableChanges,
       configPath,
       configBackupText
@@ -257,7 +270,7 @@ export async function runSync({
           sessionRestoreNeeded = appliedSessionChanges.length > 0;
           await updateSessionBackupManifest(backupDir, appliedSessionChanges);
         },
-        { busyTimeoutMs: sqliteBusyTimeoutMs }
+        { busyTimeoutMs: sqliteBusyTimeoutMs, sourceProvider, targetModel, repairModels }
       );
       emitProgress(onProgress, {
         stage: "rewrite_rollout_files",
@@ -295,10 +308,15 @@ export async function runSync({
       return {
         codexHome,
         targetProvider,
+        targetModel,
+        sourceProvider: sourceProvider ?? null,
         previousProvider: current.provider,
         backupDir,
         backupDurationMs,
         changedSessionFiles: applyResult.appliedChanges,
+        modelRewrittenSessionFiles: appliedSessionChanges.filter(
+          (change) => change.modelLineUpdates?.length > 0
+        ).length,
         skippedLockedRolloutFiles,
         sqliteRowsUpdated: sqliteResult.updatedRows,
         sqlitePresent: sqliteResult.databasePresent,
@@ -329,9 +347,100 @@ export async function runSync({
   }
 }
 
+export async function runBackup({
+  codexHome: explicitCodexHome,
+  keepCount = DEFAULT_BACKUP_RETENTION_COUNT,
+  onProgress
+} = {}) {
+  if (!Number.isInteger(keepCount) || keepCount < 1) {
+    throw new Error(`Invalid automatic keep count: ${keepCount}. Expected an integer greater than or equal to 1.`);
+  }
+
+  const codexHome = normalizeCodexHome(explicitCodexHome);
+  await ensureCodexHome(codexHome);
+  const configPath = path.join(codexHome, "config.toml");
+  const releaseLock = await acquireLock(codexHome, "backup");
+  try {
+    emitProgress(onProgress, { stage: "scan_session_files", status: "start" });
+    const { files, lockedPaths } = await collectSessionBackupSnapshot(codexHome);
+    emitProgress(onProgress, {
+      stage: "scan_session_files",
+      status: "complete",
+      fileCount: files.length,
+      lockedCount: lockedPaths.length
+    });
+
+    emitProgress(onProgress, {
+      stage: "create_backup",
+      status: "start",
+      sessionFileCount: files.length
+    });
+    const backupStartedAt = Date.now();
+    const backupDir = await createBackup({
+      codexHome,
+      targetProvider: null,
+      sourceProvider: null,
+      backupType: "manual",
+      sessionChanges: files,
+      configPath
+    });
+    const backupDurationMs = Date.now() - backupStartedAt;
+    emitProgress(onProgress, {
+      stage: "create_backup",
+      status: "complete",
+      backupDir,
+      durationMs: backupDurationMs
+    });
+
+    let autoPruneResult = null;
+    let autoPruneWarning = null;
+    emitProgress(onProgress, {
+      stage: "clean_backups",
+      status: "start",
+      keepCount
+    });
+    try {
+      autoPruneResult = await pruneBackups(codexHome, keepCount);
+    } catch (pruneError) {
+      autoPruneWarning = `Automatic backup cleanup failed: ${pruneError instanceof Error ? pruneError.message : String(pruneError)}`;
+    }
+    emitProgress(onProgress, {
+      stage: "clean_backups",
+      status: "complete",
+      deletedCount: autoPruneResult?.deletedCount ?? 0,
+      warning: autoPruneWarning
+    });
+
+    return {
+      codexHome,
+      backupDir,
+      backupDurationMs,
+      backupType: "manual",
+      sessionFilesSnapshot: files.length,
+      skippedLockedRolloutFiles: lockedPaths,
+      autoPruneResult,
+      autoPruneWarning
+    };
+  } finally {
+    await releaseLock();
+  }
+}
+
+export async function runListBackups({ codexHome: explicitCodexHome } = {}) {
+  const codexHome = normalizeCodexHome(explicitCodexHome);
+  await ensureCodexHome(codexHome);
+  return {
+    codexHome,
+    backupRoot: defaultBackupRoot(codexHome),
+    backups: await listBackups(codexHome)
+  };
+}
+
 export async function runSwitch({
   codexHome: explicitCodexHome,
   provider,
+  model,
+  repairModels = false,
   keepCount = DEFAULT_BACKUP_RETENTION_COUNT,
   onProgress
 }) {
@@ -364,6 +473,8 @@ export async function runSwitch({
     const syncResult = await runSync({
       codexHome,
       provider,
+      model,
+      repairModels,
       configBackupText: originalConfigText,
       keepCount,
       onProgress

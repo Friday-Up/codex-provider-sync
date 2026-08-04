@@ -28,9 +28,26 @@ async function removeIfPresent(targetPath) {
   await fs.rm(targetPath, { force: true });
 }
 
+function toManifestEntry(change) {
+  return {
+    path: change.path,
+    originalFirstLine: change.originalFirstLine,
+    originalSeparator: change.originalSeparator,
+    originalMtimeMs: change.originalMtimeMs,
+    ...(change.modelLineUpdates?.length
+      ? {
+          modelLineIndexes: change.modelLineUpdates.map((update) => update.index),
+          originalModelLines: change.modelLineUpdates.map((update) => update.originalText)
+        }
+      : {})
+  };
+}
+
 export async function createBackup({
   codexHome,
   targetProvider,
+  sourceProvider,
+  backupType = "sync",
   sessionChanges,
   configPath,
   configBackupText
@@ -60,13 +77,10 @@ export async function createBackup({
     namespace: BACKUP_NAMESPACE,
     codexHome,
     targetProvider,
+    sourceProvider: sourceProvider ?? null,
+    backupType,
     createdAt: new Date().toISOString(),
-    files: sessionChanges.map((change) => ({
-      path: change.path,
-      originalFirstLine: change.originalFirstLine,
-      originalSeparator: change.originalSeparator,
-      originalMtimeMs: change.originalMtimeMs
-    }))
+    files: sessionChanges.map(toManifestEntry)
   };
   await fs.writeFile(
     path.join(backupDir, "session-meta-backup.json"),
@@ -82,6 +96,8 @@ export async function createBackup({
         namespace: BACKUP_NAMESPACE,
         codexHome,
         targetProvider,
+        sourceProvider: sourceProvider ?? null,
+        backupType,
         createdAt: sessionManifest.createdAt,
         dbFiles: copiedDbFiles,
         changedSessionFiles: sessionChanges.length
@@ -101,12 +117,7 @@ export async function updateSessionBackupManifest(backupDir, sessionChanges) {
   const sessionManifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
   const metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
 
-  sessionManifest.files = sessionChanges.map((change) => ({
-    path: change.path,
-    originalFirstLine: change.originalFirstLine,
-    originalSeparator: change.originalSeparator,
-    originalMtimeMs: change.originalMtimeMs
-  }));
+  sessionManifest.files = sessionChanges.map(toManifestEntry);
   metadata.changedSessionFiles = sessionChanges.length;
 
   await fs.writeFile(manifestPath, JSON.stringify(sessionManifest, null, 2), "utf8");
@@ -125,6 +136,32 @@ export async function getBackupSummary(codexHome) {
     count: backupDirs.length,
     totalBytes
   };
+}
+
+export async function listBackups(codexHome) {
+  const backupRoot = defaultBackupRoot(codexHome);
+  const backupDirs = await listManagedBackupDirectories(backupRoot);
+  const entries = [];
+  for (const entry of backupDirs) {
+    let metadata = null;
+    try {
+      const metadataPath = path.join(entry.fullPath, "metadata.json");
+      metadata = JSON.parse(await fs.readFile(metadataPath, "utf8"));
+    } catch {
+      // Managed directories are expected to have metadata.json; treat missing as unknown.
+    }
+    entries.push({
+      name: entry.name,
+      fullPath: entry.fullPath,
+      createdAt: metadata?.createdAt ?? null,
+      backupType: metadata?.backupType ?? "sync",
+      targetProvider: metadata?.targetProvider ?? null,
+      sourceProvider: metadata?.sourceProvider ?? null,
+      changedSessionFiles: metadata?.changedSessionFiles ?? 0,
+      totalBytes: await getDirectorySize(entry.fullPath)
+    });
+  }
+  return entries;
 }
 
 export async function pruneBackups(codexHome, keepCount = DEFAULT_BACKUP_RETENTION_COUNT) {

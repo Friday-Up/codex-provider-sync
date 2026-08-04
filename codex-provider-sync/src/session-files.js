@@ -51,6 +51,81 @@ function incrementPlainCount(counts, directory, provider) {
   counts[directory][provider] = (counts[directory][provider] ?? 0) + 1;
 }
 
+function splitContentLines(content) {
+  return content.split(/(?<=\n)/);
+}
+
+function trailingNewline(chunk) {
+  if (chunk.endsWith("\r\n")) {
+    return "\r\n";
+  }
+  if (chunk.endsWith("\n")) {
+    return "\n";
+  }
+  return "";
+}
+
+export function applyLineUpdatesToContent(content, updatedFirstLine, separator, modelLineUpdates) {
+  const parts = splitContentLines(content);
+  parts[0] = `${updatedFirstLine}${separator}`;
+  for (const update of modelLineUpdates ?? []) {
+    const chunk = parts[update.index];
+    if (chunk === undefined) {
+      throw new Error(`Unable to rewrite rollout file because its line layout changed during sync.`);
+    }
+    parts[update.index] = `${update.text}${trailingNewline(chunk)}`;
+  }
+  return parts.join("");
+}
+
+async function collectModelLineUpdates(filePath, targetProvider, targetModel) {
+  let content;
+  try {
+    content = await fsp.readFile(filePath, "utf8");
+  } catch (error) {
+    throw wrapRolloutFileBusyError(error, filePath, "scan");
+  }
+
+  const parts = splitContentLines(content);
+  const updates = [];
+  for (let index = 1; index < parts.length; index += 1) {
+    const lineText = parts[index].replace(/\r?\n$/, "");
+    let parsed;
+    try {
+      parsed = JSON.parse(lineText);
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object") {
+      continue;
+    }
+
+    let changed = false;
+    if (parsed.type === "turn_context" && typeof parsed.payload?.model === "string" && parsed.payload.model !== targetModel) {
+      parsed.payload.model = targetModel;
+      changed = true;
+    }
+    if (parsed.type === "event_msg" && parsed.payload?.thread_settings && typeof parsed.payload.thread_settings.model === "string") {
+      if (parsed.payload.thread_settings.model !== targetModel) {
+        parsed.payload.thread_settings.model = targetModel;
+        changed = true;
+      }
+      if (parsed.payload.thread_settings.model_provider_id !== targetProvider) {
+        parsed.payload.thread_settings.model_provider_id = targetProvider;
+        changed = true;
+      }
+    }
+    if (changed) {
+      updates.push({
+        index,
+        text: JSON.stringify(parsed),
+        originalText: lineText
+      });
+    }
+  }
+  return updates;
+}
+
 async function fileHasEncryptedContent(filePath, firstLine) {
   if (firstLine.includes("encrypted_content")) {
     return true;
@@ -237,30 +312,43 @@ async function invokeWindowsExclusiveRewriteBatch(changes, { requireOriginalMatc
         if ($record.firstLine -ne [string]$change.originalFirstLine -or $record.offset -ne [int]$change.originalOffset) {
           return "SKIP_CHANGED"
         }
-
-        $separator = [string]$change.originalSeparator
-        $sourceOffset = [int64]$change.originalOffset
-        $headerOnly = $sourceOffset -ge [int64]$change.originalSize
-      } else {
-        $record = Read-FirstLineRecord $source
-        $separator = [string]$change.separator
-        $sourceOffset = [int64]$record.offset
-        $headerOnly = $record.offset -ge $source.Length
       }
+
+      $source.Position = 0
+      $reader = [System.IO.StreamReader]::new($source, [System.Text.Encoding]::UTF8, $false, 1024, $true)
+      $content = $reader.ReadToEnd()
+      $reader.Dispose()
+
+      $lines = [regex]::Split($content, "(?<=\n)")
+      $separator = [string]$change.originalSeparator
+      if ([string]::IsNullOrEmpty($separator)) {
+        $separator = [string]$change.separator
+      }
+      $lines[0] = [string]$change.updatedFirstLine + $separator
+
+      foreach ($update in @($change.modelLineUpdates)) {
+        if ($null -eq $update) {
+          continue
+        }
+        $chunk = $lines[[int]$update.index]
+        if ($null -eq $chunk) {
+          return "SKIP_CHANGED"
+        }
+        $suffix = ""
+        $crlf = [string][char]13 + [string][char]10
+        $lf = [string][char]10
+        if ($chunk.EndsWith($crlf)) {
+          $suffix = $crlf
+        } elseif ($chunk.EndsWith($lf)) {
+          $suffix = $lf
+        }
+        $lines[[int]$update.index] = [string]$update.text + $suffix
+      }
+      $updatedContent = [string]::Join("", $lines)
 
       $writer = [System.IO.File]::Open($tmpPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-      $firstLineBytes = $encoding.GetBytes([string]$change.updatedFirstLine)
-      $writer.Write($firstLineBytes, 0, $firstLineBytes.Length)
-
-      if (-not [string]::IsNullOrEmpty($separator)) {
-        $separatorBytes = $encoding.GetBytes($separator)
-        $writer.Write($separatorBytes, 0, $separatorBytes.Length)
-      }
-
-      if (-not $headerOnly) {
-        $source.Seek($sourceOffset, [System.IO.SeekOrigin]::Begin) | Out-Null
-        $source.CopyTo($writer)
-      }
+      $contentBytes = $encoding.GetBytes($updatedContent)
+      $writer.Write($contentBytes, 0, $contentBytes.Length)
 
       $writer.Flush()
       $writer.Dispose()
@@ -341,13 +429,14 @@ async function invokeWindowsExclusiveRewrite(change, options) {
   return result;
 }
 
-async function rewriteFirstLine(filePath, nextFirstLine, separator) {
+async function rewriteLines(filePath, { updatedFirstLine, separator, modelLineUpdates = [] }) {
   if (process.platform === "win32") {
     const result = await invokeWindowsExclusiveRewrite(
       {
         path: filePath,
         separator,
-        updatedFirstLine: nextFirstLine
+        updatedFirstLine,
+        modelLineUpdates
       },
       { requireOriginalMatch: false }
     );
@@ -361,33 +450,22 @@ async function rewriteFirstLine(filePath, nextFirstLine, separator) {
     return;
   }
 
-  const current = await readFirstLineRecord(filePath);
+  const content = await fsp.readFile(filePath, "utf8");
+  const updatedContent = applyLineUpdatesToContent(
+    content,
+    updatedFirstLine,
+    separator,
+    modelLineUpdates
+  );
   const tmpPath = `${filePath}.provider-sync.${process.pid}.${Date.now()}.tmp`;
   const writer = fs.createWriteStream(tmpPath, { encoding: "utf8" });
 
   try {
     await new Promise((resolve, reject) => {
       writer.on("error", reject);
-      writer.write(nextFirstLine);
-      if (separator) {
-        writer.write(separator);
-      }
-
-      const headerOnly =
-        current.separator === "" &&
-        current.offset === Buffer.byteLength(current.firstLine, "utf8");
-
-      if (headerOnly) {
-        writer.end();
-        writer.once("finish", resolve);
-        return;
-      }
-
-      const reader = fs.createReadStream(filePath, { start: current.offset });
-      reader.on("error", reject);
-      reader.on("end", () => writer.end());
+      writer.write(updatedContent);
+      writer.end();
       writer.once("finish", resolve);
-      reader.pipe(writer, { end: false });
     });
 
     await fsp.rename(tmpPath, filePath);
@@ -397,7 +475,7 @@ async function rewriteFirstLine(filePath, nextFirstLine, separator) {
   }
 }
 
-async function tryRewriteCollectedFirstLine(change) {
+async function tryRewriteCollectedLines(change) {
   const beforeSnapshot = await getFileSnapshot(change.path);
   if (!snapshotMatches(change, beforeSnapshot)) {
     return false;
@@ -408,29 +486,28 @@ async function tryRewriteCollectedFirstLine(change) {
     return false;
   }
 
+  const content = await fsp.readFile(change.path, "utf8");
+  let updatedContent;
+  try {
+    updatedContent = applyLineUpdatesToContent(
+      content,
+      change.updatedFirstLine,
+      change.originalSeparator,
+      change.modelLineUpdates
+    );
+  } catch {
+    return false;
+  }
+
   const tmpPath = `${change.path}.provider-sync.${process.pid}.${Date.now()}.tmp`;
   const writer = fs.createWriteStream(tmpPath, { encoding: "utf8" });
 
   try {
     await new Promise((resolve, reject) => {
       writer.on("error", reject);
-      writer.write(change.updatedFirstLine);
-      if (change.originalSeparator) {
-        writer.write(change.originalSeparator);
-      }
-
-      const headerOnly = change.originalOffset >= change.originalSize;
-      if (headerOnly) {
-        writer.end();
-        writer.once("finish", resolve);
-        return;
-      }
-
-      const reader = fs.createReadStream(change.path, { start: change.originalOffset });
-      reader.on("error", reject);
-      reader.on("end", () => writer.end());
+      writer.write(updatedContent);
+      writer.end();
       writer.once("finish", resolve);
-      reader.pipe(writer, { end: false });
     });
 
     const afterSnapshot = await getFileSnapshot(change.path);
@@ -491,7 +568,10 @@ async function findLockedFilesOnWindows(filePaths) {
 
 export async function collectSessionChanges(codexHome, targetProvider, options = {}) {
   const {
-    skipLockedReads = false
+    skipLockedReads = false,
+    sourceProvider,
+    targetModel,
+    repairModels = false
   } = options;
   const summaries = [];
   const lockedPaths = [];
@@ -525,6 +605,10 @@ export async function collectSessionChanges(codexHome, targetProvider, options =
         continue;
       }
       const currentProvider = parsed.payload.model_provider ?? "(missing)";
+      // 指定来源 provider 时，只处理该来源的会话（计数也只统计该来源）。
+      if (sourceProvider !== undefined && currentProvider !== sourceProvider) {
+        continue;
+      }
       providerCounts[dirName].set(currentProvider, (providerCounts[dirName].get(currentProvider) ?? 0) + 1);
       try {
         if (await fileHasEncryptedContent(rolloutPath, record.firstLine)) {
@@ -538,26 +622,107 @@ export async function collectSessionChanges(codexHome, targetProvider, options =
         throw error;
       }
 
-      if (targetProvider !== "__status_only__" && parsed.payload.model_provider !== targetProvider) {
-        const snapshot = await getFileSnapshot(rolloutPath);
-        parsed.payload.model_provider = targetProvider;
-        summaries.push({
-          path: rolloutPath,
-          threadId: parsed.payload.id ?? null,
-          directory: dirName,
-          originalFirstLine: record.firstLine,
-          originalSeparator: record.separator,
-          originalOffset: record.offset,
-          originalSize: snapshot.size,
-          originalMtimeMs: snapshot.mtimeMs,
-          originalProvider: currentProvider,
-          updatedFirstLine: JSON.stringify(parsed)
-        });
+      if (targetProvider === "__status_only__") {
+        continue;
       }
+
+      const isProviderChange = parsed.payload.model_provider !== targetProvider;
+      let modelLineUpdates = [];
+      if (targetModel && (isProviderChange || repairModels)) {
+        try {
+          modelLineUpdates = await collectModelLineUpdates(rolloutPath, targetProvider, targetModel);
+        } catch (error) {
+          if (skipLockedReads && isRolloutFileBusyError(error)) {
+            lockedPaths.push(rolloutPath);
+            continue;
+          }
+          throw error;
+        }
+      }
+      if (!isProviderChange && modelLineUpdates.length === 0) {
+        continue;
+      }
+
+      const snapshot = await getFileSnapshot(rolloutPath);
+      if (isProviderChange) {
+        parsed.payload.model_provider = targetProvider;
+      }
+      const change = {
+        path: rolloutPath,
+        threadId: parsed.payload.id ?? null,
+        directory: dirName,
+        originalFirstLine: record.firstLine,
+        originalSeparator: record.separator,
+        originalOffset: record.offset,
+        originalSize: snapshot.size,
+        originalMtimeMs: snapshot.mtimeMs,
+        originalProvider: currentProvider,
+        updatedFirstLine: JSON.stringify(parsed)
+      };
+      if (modelLineUpdates.length > 0) {
+        change.modelLineUpdates = modelLineUpdates;
+      }
+      summaries.push(change);
     }
   }
 
   return { changes: summaries, lockedPaths, providerCounts, encryptedContentCounts };
+}
+
+export async function collectSessionBackupSnapshot(codexHome) {
+  const files = [];
+  const lockedPaths = [];
+
+  for (const dirName of SESSION_DIRS) {
+    const rootDir = path.join(codexHome, dirName);
+    try {
+      await fsp.access(rootDir);
+    } catch {
+      continue;
+    }
+    const rolloutPaths = await listJsonlFiles(rootDir);
+    for (const rolloutPath of rolloutPaths) {
+      let record;
+      try {
+        record = await readFirstLineRecord(rolloutPath);
+      } catch (error) {
+        if (isRolloutFileBusyError(error)) {
+          lockedPaths.push(rolloutPath);
+          continue;
+        }
+        throw error;
+      }
+      const parsed = parseSessionMetaRecord(record.firstLine);
+      if (!parsed) {
+        continue;
+      }
+      let stat;
+      try {
+        stat = await fsp.stat(rolloutPath);
+      } catch (error) {
+        if (isRolloutFileBusyError(error)) {
+          lockedPaths.push(rolloutPath);
+          continue;
+        }
+        throw error;
+      }
+      files.push({
+        path: rolloutPath,
+        threadId: parsed.payload.id ?? null,
+        directory: dirName,
+        originalProvider: parsed.payload.model_provider ?? "(missing)",
+        originalFirstLine: record.firstLine,
+        originalSeparator: record.separator,
+        originalOffset: record.offset,
+        originalSize: stat.size,
+        originalMtimeMs: stat.mtimeMs
+      });
+    }
+  }
+
+  files.sort((left, right) => left.path.localeCompare(right.path));
+  lockedPaths.sort((left, right) => left.localeCompare(right));
+  return { files, lockedPaths };
 }
 
 export async function applySessionChanges(changes) {
@@ -579,7 +744,7 @@ export async function applySessionChanges(changes) {
     }
   } else {
     for (const change of normalizedChanges) {
-      if (await tryRewriteCollectedFirstLine(change)) {
+      if (await tryRewriteCollectedLines(change)) {
         appliedChanges += 1;
         appliedPaths.push(change.path);
         await restoreOriginalMtime(change.path, change.originalMtimeMs);
@@ -653,13 +818,18 @@ export async function restoreSessionChanges(manifestEntries) {
     return;
   }
 
+  const changes = manifestEntries.map((entry) => ({
+    path: entry.path,
+    separator: entry.originalSeparator ?? "\n",
+    updatedFirstLine: entry.originalFirstLine,
+    originalMtimeMs: entry.originalMtimeMs,
+    modelLineUpdates: (entry.modelLineIndexes ?? []).map((index, offset) => ({
+      index,
+      text: (entry.originalModelLines ?? [])[offset]
+    })).filter((update) => update.text !== undefined)
+  }));
+
   if (process.platform === "win32") {
-    const changes = manifestEntries.map((entry) => ({
-      path: entry.path,
-      separator: entry.originalSeparator ?? "\n",
-      updatedFirstLine: entry.originalFirstLine,
-      originalMtimeMs: entry.originalMtimeMs
-    }));
     const results = await invokeWindowsExclusiveRewriteBatch(changes, { requireOriginalMatch: false });
     const firstFailureIndex = results.findIndex((result) => result !== "APPLIED");
     if (firstFailureIndex !== -1) {
@@ -675,7 +845,12 @@ export async function restoreSessionChanges(manifestEntries) {
   }
 
   for (const entry of manifestEntries) {
-    await rewriteFirstLine(entry.path, entry.originalFirstLine, entry.originalSeparator ?? "\n");
+    const change = changes[manifestEntries.indexOf(entry)];
+    await rewriteLines(entry.path, {
+      updatedFirstLine: entry.originalFirstLine,
+      separator: entry.originalSeparator ?? "\n",
+      modelLineUpdates: change.modelLineUpdates
+    });
     await restoreOriginalMtime(entry.path, entry.originalMtimeMs);
   }
 }

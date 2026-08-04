@@ -108,10 +108,11 @@ npm run tauri build
 
 1. 打开 `Codex Provider Sync.app`
 2. 点击 **刷新状态** 查看当前 Provider 分布
-3. 选择目标同步方向：
-   - **同步到 OpenAI 官方 OAuth** —— 将所有会话改为 `openai`
-   - **同步到第三方 API Key** —— 将所有会话改为 `custom`
-4. 查看底部日志确认结果
+3. 自由选择 **来源 provider**（可选"全部"）与 **目标 provider**，点击 **执行同步**
+   - 例：想把 `custom` 的历史会话迁到 `deepseek`，来源选 `custom`、目标选 `deepseek`
+   - 例：把所有非 `openai` 的会话迁到 `openai`，来源选"全部"、目标选 `openai`
+4. 操作前可先点击 **一键备份**，误操作后可从备份恢复
+5. 查看底部日志确认结果
 
 ### ⌨️ CLI 方式
 
@@ -121,6 +122,15 @@ codex-provider status
 
 # 同步历史会话到当前 provider
 codex-provider sync
+
+# 只把指定来源的会话同步到目标 provider
+codex-provider sync --from custom --to deepseek
+
+# 同步时把会话模型改写为目标 provider 的模型（并修复已为目标 provider 的会话）
+codex-provider sync --to deepseek --model deepseek-v4-flash --repair-models
+
+# 一键备份当前状态（config + SQLite + 会话元数据）
+codex-provider backup
 
 # 切换到指定 provider 并同步
 codex-provider switch openai
@@ -134,6 +144,10 @@ codex-provider switch openai
 | --- | --- |
 | `codex-provider status` | 显示当前 provider 及分布 |
 | `codex-provider sync` | 同步历史会话到当前 provider |
+| `codex-provider sync --from <来源> --to <目标>` | 仅将指定来源的会话迁移到目标 provider |
+| `codex-provider sync --model <模型> --repair-models` | 改写会话模型字段；`--repair-models` 同时修复已为目标 provider 的会话 |
+| `codex-provider backup` | 一键备份当前状态（config.toml + SQLite + 会话元数据） |
+| `codex-provider list-backups` | 列出已有备份（GUI 恢复下拉框的数据来源） |
 | `codex-provider switch <provider-id>` | 切换 provider 并同步 |
 | `codex-provider restore <backup-dir>` | 从备份恢复 |
 | `codex-provider prune-backups` | 清理旧备份 |
@@ -146,7 +160,7 @@ codex-provider switch openai
 <summary><b>场景 1：从 API Key 切到官方 OAuth</b></summary>
 
 1. 打开 GUI，点击 **刷新状态**
-2. 点击 **同步到 OpenAI 官方 OAuth**
+2. 来源选"全部"（或 `custom`），目标选 `openai`，点击 **执行同步**
 3. 等待完成，日志显示成功
 4. 现在可以用官方 OAuth 登录，历史会话都在 ✅
 </details>
@@ -155,7 +169,7 @@ codex-provider switch openai
 <summary><b>场景 2：从官方 OAuth 切到 API Key</b></summary>
 
 1. 打开 GUI，点击 **刷新状态**
-2. 点击 **同步到第三方 API Key**
+2. 来源选"全部"（或 `openai`），目标选 `custom`，点击 **执行同步**
 3. 等待完成
 4. 切换到 API Key 登录，历史会话都在 ✅
 </details>

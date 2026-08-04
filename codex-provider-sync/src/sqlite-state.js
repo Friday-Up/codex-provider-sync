@@ -140,6 +140,7 @@ export async function updateSqliteProvider(codexHome, targetProvider, afterUpdat
   const options = typeof afterUpdateOrOptions === "function"
     ? (maybeOptions ?? {})
     : (afterUpdateOrOptions ?? {});
+  const { busyTimeoutMs, sourceProvider, targetModel, repairModels = false } = options;
 
   const dbPath = stateDbPath(codexHome);
   try {
@@ -155,15 +156,40 @@ export async function updateSqliteProvider(codexHome, targetProvider, afterUpdat
   let transactionOpen = false;
   try {
     db = openDatabase(dbPath);
-    setBusyTimeout(db, options.busyTimeoutMs);
+    setBusyTimeout(db, busyTimeoutMs);
     db.exec("BEGIN IMMEDIATE");
     transactionOpen = true;
-    const stmt = db.prepare(`
+    const setClauses = ["model_provider = ?"];
+    const params = [targetProvider];
+    if (targetModel) {
+      setClauses.push("model = ?");
+      params.push(targetModel);
+    }
+
+    const whereParts = [];
+    if (sourceProvider === "(missing)") {
+      whereParts.push("(model_provider IS NULL OR model_provider = '')");
+    } else if (sourceProvider !== undefined) {
+      whereParts.push("model_provider = ?");
+      params.push(sourceProvider);
+    }
+
+    const innerParts = [];
+    innerParts.push("COALESCE(model_provider, '') <> ?");
+    params.push(targetProvider);
+    if (targetModel && repairModels) {
+      innerParts.push("COALESCE(model_provider, '') = ? AND (model IS NULL OR model <> ?)");
+      params.push(targetProvider, targetModel);
+    }
+    whereParts.push(`(${innerParts.join(" OR ")})`);
+
+    const sql = `
       UPDATE threads
-      SET model_provider = ?
-      WHERE COALESCE(model_provider, '') <> ?
-    `);
-    const result = stmt.run(targetProvider, targetProvider);
+      SET ${setClauses.join(", ")}
+      WHERE ${whereParts.join(" AND ")}
+    `;
+    const stmt = db.prepare(sql);
+    const result = stmt.run(...params);
     if (afterUpdate) {
       await afterUpdate({
         updatedRows: result.changes ?? 0,

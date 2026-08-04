@@ -32,6 +32,58 @@ export function readCurrentProviderFromConfigText(configText) {
   return { provider: DEFAULT_PROVIDER, implicit: true };
 }
 
+export function readRootModelFromConfigText(configText) {
+  const lines = splitLines(configText);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+    if (trimmed.startsWith("[")) {
+      break;
+    }
+    const match = trimmed.match(/^model\s*=\s*"([^"]+)"\s*$/);
+    if (match) {
+      return match[1];
+    }
+  }
+  return null;
+}
+
+export function readProviderSectionModelFromConfigText(configText, providerId) {
+  const lines = splitLines(configText);
+  let insideSection = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("[")) {
+      insideSection = trimmed === `[model_providers.${providerId}]`;
+      continue;
+    }
+    if (insideSection) {
+      const match = trimmed.match(/^model\s*=\s*"([^"]+)"\s*$/);
+      if (match) {
+        return match[1];
+      }
+    }
+  }
+  return null;
+}
+
+export function resolveProviderModel(configText, providerId, explicitModel) {
+  if (explicitModel) {
+    return explicitModel;
+  }
+  const sectionModel = readProviderSectionModelFromConfigText(configText, providerId);
+  if (sectionModel) {
+    return sectionModel;
+  }
+  const current = readCurrentProviderFromConfigText(configText);
+  if (!current.implicit && current.provider === providerId) {
+    return readRootModelFromConfigText(configText);
+  }
+  return null;
+}
+
 export function listConfiguredProviderIds(configText) {
   const providerIds = new Set([DEFAULT_PROVIDER]);
   const regex = /^\[model_providers\.([A-Za-z0-9_.-]+)]\s*$/gm;
